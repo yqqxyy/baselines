@@ -13,8 +13,8 @@ class Config:
 
     # Trainer Args
     seed = 1
-    num_cores = None  # Number of cores to use for training
-    num_envs = 6  # Number of environments to use for training
+    num_cores = 8  # Number of cores to use for training
+    num_envs = 8  # Number of environments to use for training
     num_buffers = 2  # Number of buffers to use for training
     rollout_batch_size = 2**15 # Number of steps to rollout
     eval_batch_size = 2**15 # Number of steps to rollout for eval
@@ -29,8 +29,8 @@ class Config:
     max_opponent_policies = 0  # Maximum number of opponent policies to train against
     eval_num_policies = 2 # Number of policies to use for evaluation
     eval_num_rounds = 1 # Number of rounds to use for evaluation
-    wandb_project = None  # WandB project name
-    wandb_entity = None  # WandB entity name
+    wandb_project = "nmmo2023_baseline"  # WandB project name
+    wandb_entity = 'yqqxyy'  # WandB entity name
 
     # PPO Args
     bptt_horizon = 8  # Train on this number of steps of a rollout at a time. Used to reduce GPU memory.
