@@ -8,7 +8,7 @@ class Config:
     local_mode = False  # Run in local mode
     # Track to run - options: reinforcement_learning, curriculum_generation
     track = "rl"
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "mps" if torch.backends.mps.is_built() else "cpu"
     #record_loss = False  # log all minibatch loss and actions, for debugging
 
     # Trainer Args

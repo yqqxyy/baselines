@@ -55,7 +55,7 @@ class CleanPuffeRL:
     seed: int = 1
     torch_deterministic: bool = True
     vectorization: ... = pufferlib.vectorization.Serial
-    device: str = torch.device("cuda") if torch.cuda.is_available() else "cpu"
+    device: str = "mps" if torch.backends.mps.is_built() else "cpu"
     total_timesteps: int = 10_000_000
     learning_rate: float = 2.5e-4
     num_buffers: int = 1
@@ -207,7 +207,7 @@ class CleanPuffeRL:
             else:
                 next_lstm_state.append(None)
 
-        allocated_torch = torch.cuda.memory_allocated(self.device)
+        allocated_torch = torch.mps.current_allocated_memory()
         allocated_cpu = self.process.memory_info().rss
         self.data = SimpleNamespace(
             buf=0,
@@ -227,7 +227,7 @@ class CleanPuffeRL:
             values=torch.zeros(self.batch_size + 1).to(self.device),
         )
 
-        allocated_torch = torch.cuda.memory_allocated(self.device) - allocated_torch
+        allocated_torch = torch.mps.current_allocated_memory() - allocated_torch
         allocated_cpu = self.process.memory_info().rss - allocated_cpu
         if self.verbose:
             print(
@@ -269,7 +269,7 @@ class CleanPuffeRL:
             ) for p in self.policy_store.select_policies(self.policy_selector)
         })
 
-        allocated_torch = torch.cuda.memory_allocated(self.device)
+        allocated_torch = torch.mps.current_allocated_memory()
         allocated_cpu = self.process.memory_info().rss
         ptr = env_step_time = inference_time = agent_steps_collected = 0
         padded_steps_collected = 0
@@ -435,7 +435,7 @@ class CleanPuffeRL:
                 }
             )
 
-        allocated_torch = torch.cuda.memory_allocated(self.device) - allocated_torch
+        allocated_torch = torch.mps.current_allocated_memory() - allocated_torch
         allocated_cpu = self.process.memory_info().rss - allocated_cpu
         if self.verbose:
             print(
@@ -475,7 +475,7 @@ class CleanPuffeRL:
             )
 
         # assert self.num_steps % bptt_horizon == 0, "num_steps must be divisible by bptt_horizon"
-        allocated_torch = torch.cuda.memory_allocated(self.device)
+        allocated_torch = torch.mps.current_allocated_memory()
         allocated_cpu = self.process.memory_info().rss
 
         # Annealing the rate if instructed to do so.
@@ -632,7 +632,7 @@ class CleanPuffeRL:
 
         print(f"\tTrain={train_sps}\n")
 
-        allocated_torch = torch.cuda.memory_allocated(self.device) - allocated_torch
+        allocated_torch = torch.mps.current_allocated_memory() - allocated_torch
         allocated_cpu = self.process.memory_info().rss - allocated_cpu
         if self.verbose:
             print(

@@ -324,7 +324,7 @@ if __name__ == "__main__":
         "--device",
         dest="device",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
+        default="mps" if torch.backends.mps.is_built() else "cpu",
         help="Device to use for evaluation/ranking (Default: cuda if available, otherwise cpu)",
     )
     parser.add_argument(

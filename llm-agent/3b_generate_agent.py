@@ -14,7 +14,7 @@ nf4_config = BitsAndBytesConfig(
 )
 
 # Load the tokenizer and model
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = "mps" if torch.backends.mps.is_built() else 'cpu'
 tokenizer = AutoTokenizer.from_pretrained("cerebras/btlm-3b-8k-base")
 model = AutoModelForCausalLM.from_pretrained("cerebras/btlm-3b-8k-base", trust_remote_code=True, device_map='auto', quantization_config=nf4_config)
 

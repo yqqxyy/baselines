@@ -34,10 +34,10 @@ class TaskEncoder:
         batch_size: Size of each batch during embedding computation.
         tmp_file_path: Temporary file path for saving intermediate data.
         """
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "mps" if torch.backends.mps.is_built() else "cpu"
         self.tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
         self.tokenizer.pad_token = self.tokenizer.eos_token
-        if self.device == "cuda":
+        if self.device == "mps":
             self.model = AutoModelForCausalLM.from_pretrained(checkpoint,
                                                               trust_remote_code=True,
                                                               device_map="auto",
@@ -144,7 +144,7 @@ class TaskEncoder:
         self.model = None
         self.tokenizer = None
         gc.collect()
-        torch.cuda.empty_cache()
+        torch.mps.empty_cache()
 
     def __enter__(self):
         return self
