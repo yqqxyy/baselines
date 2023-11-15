@@ -6,6 +6,8 @@ from pufferlib.vectorization import Serial, Multiprocessing
 from pufferlib.policy_store import DirectoryPolicyStore
 from pufferlib.frameworks import cleanrl
 
+import pufferlib.models
+
 import environment
 
 from reinforcement_learning import clean_pufferl, policy, config
@@ -34,7 +36,7 @@ def setup_env(args):
             hidden_size=args.hidden_size,
             task_size=args.task_size
         )
-        return cleanrl.Policy(learner_policy)
+        return cleanrl.RecurrentPolicy(pufferlib.models.RecurrentWrapper(envs.driver_env,learner_policy,input_size = args.input_size,hidden_size = args.hidden_size))
 
     trainer = clean_pufferl.CleanPuffeRL(
         device=torch.device(args.device),
