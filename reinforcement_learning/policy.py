@@ -115,8 +115,113 @@ class TileEncoder(torch.nn.Module):
     return tile
 
 
+
+
+def add_dims(x, ndim: int):
+    """Adds dimensions to a tensor to match the shape of another tensor."""
+    if (dim_diff := ndim - x.dim()) < 0:
+        raise ValueError(f"Target ndim ({ndim}) is larger than input ndim ({x.dim()})")
+
+    if dim_diff > 0:
+        x = x.view(x.shape[0], *dim_diff * (1,), *x.shape[1:])
+
+    return x
+
+def masked_softmax(x, mask, dim: int = -1):
+    """Applies softmax over a tensor without including padded elements."""
+    if mask is not None:
+        mask = add_dims(mask,x.dim())
+        x = x.masked_fill(mask, -torch.inf)
+
+    x = F.softmax(x, dim=dim)
+
+    if mask is not None:
+        x = x.masked_fill(mask, 0)
+
+    return x
+
+
+class MultiHeadAttention(torch.nn.Module):
+    def __init__(self, embed_dim, num_heads: int = 8, dropout: float = 0.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.embed_dim = embed_dim
+
+        assert embed_dim % self.num_heads == 0
+
+        self.head_dim = embed_dim // self.num_heads
+
+        self.wq = torch.nn.Linear(embed_dim, embed_dim)
+        self.wk = torch.nn.Linear(embed_dim, embed_dim)
+        self.wv = torch.nn.Linear(embed_dim, embed_dim)
+
+        self.dense = torch.nn.Linear(embed_dim, embed_dim)
+
+        self.dropout = torch.nn.Dropout(dropout)
+
+    def split_heads(self, x, batch_size):
+        x = x.view(batch_size, -1, self.num_heads, self.head_dim)
+        return x.transpose(1, 2)
+
+    def forward(self, v, k, q, mask):
+        batch_size = q.size(0)
+
+        q = self.wq(q)
+        k = self.wk(k)
+        v = self.wv(v)
+
+        q = self.split_heads(q, batch_size)
+        k = self.split_heads(k, batch_size)
+        v = self.split_heads(v, batch_size)
+
+        scaled_attention, attention_weights = self.scaled_dot_product_attention(q, k, v, mask)
+
+        scaled_attention = scaled_attention.transpose(1, 2).contiguous().view(batch_size, -1, self.embed_dim)
+        output = self.dense(scaled_attention)
+
+        return output
+
+    def scaled_dot_product_attention(self, q, k, v, mask):
+        matmul_qk = torch.matmul(q, k.transpose(-2, -1))
+        dk = torch.tensor(k.size(-1), dtype=torch.float32)
+        scaled_attention_logits = matmul_qk / torch.sqrt(dk)
+
+        # if mask is not None:
+        #     scaled_attention_logits += (mask * -1e9)
+
+        # attention_weights = F.softmax(scaled_attention_logits, dim=-1)
+
+        attention_weights = masked_softmax(scaled_attention_logits, mask,dim=-1)
+        attention_weights = self.dropout(attention_weights)
+        output = torch.matmul(attention_weights, v)
+
+        return output, attention_weights
+
+
+class TransformerEncoder(torch.nn.Module):
+    def __init__(self,embed_dim,num_layers: int=1, num_heads: int = 8, dropout: float = 0.0):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_layers = num_layers
+
+        self.layers = torch.nn.ModuleList(
+            [
+                MultiHeadAttention(embed_dim, num_heads, dropout)
+                for _ in range(num_layers)
+            ]
+        )
+        self.final_norm = torch.nn.LayerNorm(embed_dim)
+
+    def forward(self, x, **kwargs):
+        """Pass the input through all layers sequentially."""
+        for layer in self.layers:
+            x = x+layer(x,x,x, **kwargs)
+        x = self.final_norm(x)
+        return x
+
+
 class PlayerEncoder(torch.nn.Module):
-  def __init__(self, input_size, hidden_size):
+  def __init__(self, input_size, hidden_size, num_heads: int = 8):
     super().__init__()
     self.entity_dim = 31
     self.player_offset = torch.tensor([i * 256 for i in range(self.entity_dim)])
@@ -125,9 +230,14 @@ class PlayerEncoder(torch.nn.Module):
     self.agent_fc = torch.nn.Linear(self.entity_dim * 32, hidden_size)
     self.my_agent_fc = torch.nn.Linear(self.entity_dim * 32, input_size)
 
+    self.num_heads = num_heads
+
+    self.transformer = TransformerEncoder(self.entity_dim*32,num_layers=6)
+
   def forward(self, agents, my_id):
     # Pull out rows corresponding to the agent
     agent_ids = agents[:, :, EntityId]
+    valid_mask = agent_ids==0
     mask = (agent_ids == my_id.unsqueeze(1)) & (agent_ids != 0)
     mask = mask.int()
     row_indices = torch.where(
@@ -141,6 +251,9 @@ class PlayerEncoder(torch.nn.Module):
 
     # Embed each feature separately
     agent_embeddings = agent_embeddings.view(batch, agent, attrs * embed)
+
+    agent_embeddings = self.transformer(agent_embeddings,mask=valid_mask)
+
     my_agent_embeddings = agent_embeddings[
         torch.arange(agents.shape[0]), row_indices
     ]
