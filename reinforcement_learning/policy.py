@@ -42,8 +42,8 @@ class Baseline(pufferlib.models.Policy):
     self.flat_observation_structure = env.flat_observation_structure
 
     self.tile_encoder = TileEncoder(input_size)
-    self.player_encoder = PlayerEncoder(input_size, hidden_size)
-    self.item_encoder = ItemEncoder(input_size, hidden_size)
+    self.player_encoder = PlayerEncoder(input_size, hidden_size, num_heads = 8)
+    self.item_encoder = ItemEncoder(input_size, hidden_size, num_heads = 8)
     self.inventory_encoder = InventoryEncoder(input_size, hidden_size)
     self.market_encoder = MarketEncoder(input_size, hidden_size)
     self.task_encoder = TaskEncoder(input_size, hidden_size, task_size)
@@ -55,8 +55,11 @@ class Baseline(pufferlib.models.Policy):
     env_outputs = pufferlib.emulation.unpack_batched_obs(flat_observations,
         self.flat_observation_space, self.flat_observation_structure)
     tile = self.tile_encoder(env_outputs["Tile"])
+
+    ticks_repeat = torch.repeat_interleave(env_outputs['CurrentTick'][:, None, :], env_outputs["Entity"].shape[-2], dim=1)
+    Entity_with_tick = torch.cat([ticks_repeat, env_outputs["Entity"]], dim=2)
     player_embeddings, my_agent = self.player_encoder(
-        env_outputs["Entity"], env_outputs["AgentId"][:, 0]
+        Entity_with_tick, env_outputs["AgentId"][:, 0]
     )
 
     item_embeddings = self.item_encoder(env_outputs["Inventory"])
@@ -115,32 +118,223 @@ class TileEncoder(torch.nn.Module):
     return tile
 
 
-class PlayerEncoder(torch.nn.Module):
-  def __init__(self, input_size, hidden_size):
-    super().__init__()
-    self.entity_dim = 31
-    self.player_offset = torch.tensor([i * 256 for i in range(self.entity_dim)])
-    self.embedding = torch.nn.Embedding(self.entity_dim * 256, 32)
+class Dense(torch.nn.Module):
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        hidden_layers: list,
+        activation: str,
+        final_activation: str = None,
+        norm_layer: str = None,
+        norm_final_layer: bool = False,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
 
-    self.agent_fc = torch.nn.Linear(self.entity_dim * 32, hidden_size)
-    self.my_agent_fc = torch.nn.Linear(self.entity_dim * 32, input_size)
+        # Save the networks input and output sizes
+        self.input_size = input_size
+        self.output_size = output_size
+
+        # build nodelist
+        node_list = [input_size, *hidden_layers, output_size]
+
+        # input and hidden layers
+        layers = []
+
+        num_layers = len(node_list) - 1
+        for i in range(num_layers):
+            is_final_layer = i == num_layers - 1
+
+            # normalisation first
+            if norm_layer and (norm_final_layer or not is_final_layer):
+                layers.append(getattr(torch.nn, norm_layer)(node_list[i], elementwise_affine=False))
+
+            # then dropout
+            if dropout and (norm_final_layer or not is_final_layer):
+                layers.append(torch.nn.Dropout(dropout))
+
+            # linear projection
+            layers.append(torch.nn.Linear(node_list[i], node_list[i + 1]))
+
+            # activation
+            if not is_final_layer:
+                layers.append(getattr(torch.nn, activation)())
+
+            # final layer: return logits by default, otherwise apply activation
+            elif final_activation:
+                layers.append(getattr(torch.nn, final_activation)())
+
+        # build the net
+        self.net = torch.nn.Sequential(*layers)
+
+    def forward(self, x):
+
+        return self.net(x)
+
+def add_dims(x, ndim: int):
+    """Adds dimensions to a tensor to match the shape of another tensor."""
+    if (dim_diff := ndim - x.dim()) < 0:
+        raise ValueError(f"Target ndim ({ndim}) is larger than input ndim ({x.dim()})")
+
+    if dim_diff > 0:
+        x = x.view(x.shape[0], *dim_diff * (1,), *x.shape[1:])
+
+    return x
+
+def masked_softmax(x, mask, dim: int = -1):
+    """Applies softmax over a tensor without including padded elements."""
+    if mask is not None:
+        mask = add_dims(mask,x.dim())
+        x = x.masked_fill(mask, -torch.inf)
+
+    x = F.softmax(x, dim=dim)
+
+    if mask is not None:
+        x = x.masked_fill(mask, 0)
+
+    return x
+
+
+class MultiHeadAttention(torch.nn.Module):
+    def __init__(self, embed_dim, num_heads: int = 8, dropout: float = 0.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.embed_dim = embed_dim
+
+        assert embed_dim % self.num_heads == 0
+
+        self.head_dim = embed_dim // self.num_heads
+
+        self.wq = torch.nn.Linear(embed_dim, embed_dim)
+        self.wk = torch.nn.Linear(embed_dim, embed_dim)
+        self.wv = torch.nn.Linear(embed_dim, embed_dim)
+
+        self.dense = torch.nn.Linear(embed_dim, embed_dim)
+
+        self.dropout = torch.nn.Dropout(dropout)
+
+    def split_heads(self, x, batch_size):
+        x = x.view(batch_size, -1, self.num_heads, self.head_dim)
+        return x.transpose(1, 2)
+
+    def forward(self, v, k, q, mask):
+        batch_size = q.size(0)
+
+        q = self.wq(q)
+        k = self.wk(k)
+        v = self.wv(v)
+
+        q = self.split_heads(q, batch_size)
+        k = self.split_heads(k, batch_size)
+        v = self.split_heads(v, batch_size)
+
+        scaled_attention, attention_weights = self.scaled_dot_product_attention(q, k, v, mask)
+
+        scaled_attention = scaled_attention.transpose(1, 2).contiguous().view(batch_size, -1, self.embed_dim)
+        output = self.dense(scaled_attention)
+
+        return output
+
+    def scaled_dot_product_attention(self, q, k, v, mask):
+        matmul_qk = torch.matmul(q, k.transpose(-2, -1))
+        dk = torch.tensor(k.size(-1), dtype=torch.float32)
+        scaled_attention_logits = matmul_qk / torch.sqrt(dk)
+
+        # if mask is not None:
+        #     scaled_attention_logits += (mask * -1e9)
+
+        # attention_weights = F.softmax(scaled_attention_logits, dim=-1)
+
+        attention_weights = masked_softmax(scaled_attention_logits, mask,dim=-1)
+        attention_weights = self.dropout(attention_weights)
+        output = torch.matmul(attention_weights, v)
+
+        return output, attention_weights
+
+
+class TransformerEncoder(torch.nn.Module):
+    def __init__(self, embed_dim, num_layers: int=1, num_heads: int = 8, dense_config = None, dropout: float = 0.0):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_layers = num_layers
+
+        self.layers = torch.nn.ModuleList(
+            [
+                MultiHeadAttention(embed_dim, num_heads, dropout)
+                for _ in range(num_layers)
+            ]
+        )
+        if dense_config:
+            self.dense = Dense(
+                input_size=embed_dim,
+                output_size=embed_dim,
+                **dense_config,
+            )
+        self.norm1 = torch.nn.LayerNorm(embed_dim)
+        self.norm2 = torch.nn.LayerNorm(embed_dim)
+        self.final_norm = torch.nn.LayerNorm(embed_dim)
+
+    def forward(self, x, **kwargs):
+        """Pass the input through all layers sequentially."""
+        for layer in self.layers:
+          x = x + self.norm2(layer(self.norm1(x), self.norm1(x), self.norm1(x), **kwargs))
+          if self.dense:
+            x = x + self.dense(x)
+        x = self.final_norm(x)
+        return x
+    
+
+class GlobalAttentionPooling(torch.nn.Module):
+    def __init__(self, input_size: int):
+        super().__init__()
+        self.gate_nn = torch.nn.Linear(input_size, 1)
+
+    def forward(self, x, mask = None):
+        if mask is not None:
+            mask = mask.unsqueeze(-1)
+
+        weights = masked_softmax(self.gate_nn(x), mask, dim=1)
+        return (x * weights).sum(dim=1)
+
+
+class PlayerEncoder(torch.nn.Module):
+  def __init__(self, input_size, hidden_size, num_heads: int = 8):
+    super().__init__()
+    #self.entity_dim = 31
+    self.entity_dim = 32 # 31 entity dims + 1 tick dim
+    # self.player_offset = torch.tensor([i * 256 for i in range(self.entity_dim)])
+    # self.embedding = torch.nn.Embedding(self.entity_dim * 256, 32)
+
+    self.agent_fc = torch.nn.Linear(self.entity_dim * 4, hidden_size)
+    self.my_agent_fc = torch.nn.Linear(self.entity_dim * 4, input_size)
+
+    self.dense = Dense(self.entity_dim, self.entity_dim*4, hidden_layers=[self.entity_dim*2], activation="SiLU", norm_layer="LayerNorm")
+    self.num_heads = num_heads
+    self.transformer = TransformerEncoder(self.entity_dim*4, num_layers=6, num_heads= self.num_heads, dense_config={"hidden_layers":[256], "activation": "SiLU", "norm_layer": "LayerNorm"})
 
   def forward(self, agents, my_id):
     # Pull out rows corresponding to the agent
     agent_ids = agents[:, :, EntityId]
+    valid_mask = agent_ids==0
     mask = (agent_ids == my_id.unsqueeze(1)) & (agent_ids != 0)
     mask = mask.int()
     row_indices = torch.where(
         mask.any(dim=1), mask.argmax(dim=1), torch.zeros_like(mask.sum(dim=1))
     )
 
-    agent_embeddings = self.embedding(
-        agents.long().clip(0, 255) + self.player_offset.to(agents.device)
-    )
-    batch, agent, attrs, embed = agent_embeddings.shape
+    # agent_embeddings = self.embedding(
+    #     agents.long().clip(0, 255) + self.player_offset.to(agents.device)
+    # )
+    # batch, agent, attrs, embed = agent_embeddings.shape
 
-    # Embed each feature separately
-    agent_embeddings = agent_embeddings.view(batch, agent, attrs * embed)
+    # # Embed each feature separately
+    # agent_embeddings = agent_embeddings.view(batch, agent, attrs * embed)
+
+    agent_embeddings = self.dense(agents)
+
+    agent_embeddings = self.transformer(agent_embeddings,mask=valid_mask)
+
     my_agent_embeddings = agent_embeddings[
         torch.arange(agents.shape[0]), row_indices
     ]
@@ -154,78 +348,148 @@ class PlayerEncoder(torch.nn.Module):
 
 
 class ItemEncoder(torch.nn.Module):
-  def __init__(self, input_size, hidden_size):
+  def __init__(self, input_size, hidden_size, num_heads: int = 8):
     super().__init__()
-    self.item_offset = torch.tensor([i * 256 for i in range(16)])
-    self.embedding = torch.nn.Embedding(256, 32)
+    # self.item_offset = torch.tensor([i * 256 for i in range(16)])
+    # self.embedding = torch.nn.Embedding(256, 32)
 
-    self.fc = torch.nn.Linear(2 * 32 + 12, hidden_size)
+    # self.fc = torch.nn.Linear(2 * 32 + 12, hidden_size)
 
-    self.discrete_idxs = [1, 14]
-    self.discrete_offset = torch.Tensor([2, 0])
-    self.continuous_idxs = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15]
-    self.continuous_scale = torch.Tensor(
-        [
-            1 / 10,
-            1 / 10,
-            1 / 10,
-            1 / 100,
-            1 / 100,
-            1 / 100,
-            1 / 40,
-            1 / 40,
-            1 / 40,
-            1 / 100,
-            1 / 100,
-            1 / 100,
-        ]
-    )
+    # self.discrete_idxs = [1, 14]
+    # self.discrete_offset = torch.Tensor([2, 0])
+    # self.continuous_idxs = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15]
+    # self.continuous_scale = torch.Tensor(
+    #     [
+    #         1 / 10,
+    #         1 / 10,
+    #         1 / 10,
+    #         1 / 100,
+    #         1 / 100,
+    #         1 / 100,
+    #         1 / 40,
+    #         1 / 40,
+    #         1 / 40,
+    #         1 / 100,
+    #         1 / 100,
+    #         1 / 100,
+    #     ]
+    # )
+
+    item_embed_dim=16
+    hidden_embed_dim1=32
+    hidden_embed_dim2=64
+    hidden_embed_dim3=128
+    self.dense1 = Dense(item_embed_dim, hidden_embed_dim2, hidden_layers=[hidden_embed_dim1], activation="SiLU", norm_layer="LayerNorm")
+    self.dense2 = Dense(hidden_embed_dim2, hidden_size, hidden_layers=[hidden_embed_dim3], activation="SiLU", norm_layer="LayerNorm")
+    self.final_norm = torch.nn.LayerNorm(hidden_size)
+    #self.num_heads = num_heads
+    #self.transformer = TransformerEncoder(hidden_embed_dim, num_layers=6, num_heads= self.num_heads, dense_config={"hidden_layers":[128], "activation": "SiLU", "norm_layer": "LayerNorm"})
+    #self.fc = torch.nn.Linear(hidden_embed_dim, input_size)
 
   def forward(self, items):
-    if self.discrete_offset.device != items.device:
-      self.discrete_offset = self.discrete_offset.to(items.device)
-      self.continuous_scale = self.continuous_scale.to(items.device)
+    # if self.discrete_offset.device != items.device:
+    #   self.discrete_offset = self.discrete_offset.to(items.device)
+    #   self.continuous_scale = self.continuous_scale.to(items.device)
 
-    # Embed each feature separately
-    discrete = items[:, :, self.discrete_idxs] + self.discrete_offset
-    discrete = self.embedding(discrete.long().clip(0, 255))
-    batch, item, attrs, embed = discrete.shape
-    discrete = discrete.view(batch, item, attrs * embed)
+    # # Embed each feature separately
+    # discrete = items[:, :, self.discrete_idxs] + self.discrete_offset
+    # discrete = self.embedding(discrete.long().clip(0, 255))
+    # batch, item, attrs, embed = discrete.shape
+    # discrete = discrete.view(batch, item, attrs * embed)
 
-    continuous = items[:, :, self.continuous_idxs] / self.continuous_scale
+    # continuous = items[:, :, self.continuous_idxs] / self.continuous_scale
 
-    item_embeddings = torch.cat([discrete, continuous], dim=-1)
-    item_embeddings = self.fc(item_embeddings)
+    # item_embeddings = torch.cat([discrete, continuous], dim=-1)
+
+    # item_ids = items[:, :, EntityId]
+    # valid_mask = item_ids==0
+    # print(valid_mask.sum())
+
+    # item_embeddings = self.dense(items)
+    # item_embeddings = self.transformer(item_embeddings,mask=valid_mask)
+
+    # item_embeddings = self.fc(item_embeddings)
+    item_embeddings = self.dense1(items)
+    item_embeddings = self.dense2(item_embeddings)
+    item_embeddings = self.final_norm(item_embeddings)
     return item_embeddings
 
 
 class InventoryEncoder(torch.nn.Module):
   def __init__(self, input_size, hidden_size):
     super().__init__()
-    self.fc = torch.nn.Linear(12 * hidden_size, input_size)
+    # self.fc = torch.nn.Linear(12 * hidden_size, input_size)
+
+    self.pooling = GlobalAttentionPooling(input_size=input_size)
 
   def forward(self, inventory):
-    agents, items, hidden = inventory.shape
-    inventory = inventory.view(agents, items * hidden)
-    return self.fc(inventory)
+    # agents, items, hidden = inventory.shape
+    # inventory = inventory.view(agents, items * hidden)
+
+    inventory_ids = inventory[:, :, EntityId]
+    valid_mask = inventory_ids==0
+
+    return self.pooling(inventory, mask=valid_mask) 
 
 
 class MarketEncoder(torch.nn.Module):
   def __init__(self, input_size, hidden_size):
     super().__init__()
-    self.fc = torch.nn.Linear(hidden_size, input_size)
+    # self.fc = torch.nn.Linear(hidden_size, input_size)
+
+    self.pooling = GlobalAttentionPooling(input_size=input_size)
 
   def forward(self, market):
-    return self.fc(market).mean(-2)
+
+    market_ids = market[:, :, EntityId]
+    valid_mask = market_ids==0
+
+    return self.pooling(market, mask=valid_mask) 
+
+    #return self.fc(market).mean(-2)
+
+
+
+class ResNet(torch.nn.Module):
+  def __init__(self, 
+        num_layers: int,
+        input_size: int,
+        output_size: int,
+        hidden_layers: list,
+        activation: str,
+        norm_layer: str = None,
+        dropout=0.0):
+    super().__init__()
+
+    layers = []
+
+    self.num_layers = num_layers
+
+    self.activation = getattr(torch.nn, activation)()
+
+    for i in range(self.num_layers):
+      layers.append( Dense(input_size= input_size, output_size= output_size, hidden_layers= hidden_layers, activation= activation, norm_layer=norm_layer, dropout=dropout))
+
+      # build the net
+    self.net = torch.nn.Sequential(*layers)
+
+  def forward(self, x):
+
+    for i in range(self.num_layers):
+      x = self.activation(x + self.net(x))
+
+    return x
 
 
 class TaskEncoder(torch.nn.Module):
   def __init__(self, input_size, hidden_size, task_size):
     super().__init__()
+
+    self.resnet = ResNet(num_layers=16, input_size=task_size, output_size=task_size, hidden_layers=[1024], activation="SiLU", norm_layer='LayerNorm',dropout=0.1)
     self.fc = torch.nn.Linear(task_size, input_size)
 
   def forward(self, task):
-    return self.fc(task.clone())
+    return self.fc(self.resnet(task.clone()))
 
 
 class ActionDecoder(torch.nn.Module):
