@@ -63,10 +63,10 @@ class Baseline(pufferlib.models.Policy):
     )
 
     item_embeddings = self.item_encoder(env_outputs["Inventory"])
-    inventory = self.inventory_encoder(item_embeddings)
+    inventory = self.inventory_encoder(item_embeddings, env_outputs["Inventory"])
 
     market_embeddings = self.item_encoder(env_outputs["Market"])
-    market = self.market_encoder(market_embeddings)
+    market = self.market_encoder(market_embeddings, env_outputs["Market"])
 
     task = self.task_encoder(env_outputs["Task"])
 
@@ -210,8 +210,6 @@ class MultiHeadAttention(torch.nn.Module):
         self.wk = torch.nn.Linear(embed_dim, embed_dim)
         self.wv = torch.nn.Linear(embed_dim, embed_dim)
 
-        self.dense = torch.nn.Linear(embed_dim, embed_dim)
-
         self.dropout = torch.nn.Dropout(dropout)
 
     def split_heads(self, x, batch_size):
@@ -232,9 +230,8 @@ class MultiHeadAttention(torch.nn.Module):
         scaled_attention, attention_weights = self.scaled_dot_product_attention(q, k, v, mask)
 
         scaled_attention = scaled_attention.transpose(1, 2).contiguous().view(batch_size, -1, self.embed_dim)
-        output = self.dense(scaled_attention)
 
-        return output
+        return scaled_attention
 
     def scaled_dot_product_attention(self, q, k, v, mask):
         matmul_qk = torch.matmul(q, k.transpose(-2, -1))
@@ -297,14 +294,95 @@ class GlobalAttentionPooling(torch.nn.Module):
         weights = masked_softmax(self.gate_nn(x), mask, dim=1)
         return (x * weights).sum(dim=1)
 
+class CLSPooling(torch.nn.Module):
+    def __init__(self, embed_dim, CLSidx: int = 0, num_heads: int = 8, dropout: float = 0.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.embed_dim = embed_dim
+
+        assert embed_dim % self.num_heads == 0
+
+        self.head_dim = embed_dim // self.num_heads
+
+        self.CLSidx = CLSidx
+
+        self.wq = torch.nn.Linear(embed_dim, embed_dim)
+        self.wk = torch.nn.Linear(embed_dim, embed_dim)
+        self.wv = torch.nn.Linear(embed_dim, embed_dim)
+
+        self.dropout = torch.nn.Dropout(dropout)
+
+    def split_heads(self, x, batch_size):
+        x = x.view(batch_size, -1, self.num_heads, self.head_dim)
+        return x.transpose(1, 2)
+
+    def forward(self, v, k, q, mask):
+        batch_size = q.size(0)
+
+        q = self.wq(q)
+        k = self.wk(k)
+        v = self.wv(v)
+
+        q = self.split_heads(q, batch_size)
+        k = self.split_heads(k, batch_size)
+        v = self.split_heads(v, batch_size)
+
+        scaled_CLS, attention_weights = self.attention_CLS(q, k, v, mask)
+
+        scaled_CLS = scaled_CLS.transpose(1, 2).contiguous().view(batch_size, -1, self.embed_dim)
+
+        return scaled_CLS
+
+    def attention_CLS(self, q, k, v, mask):
+        matmul_CLS_k = torch.matmul(q[:,:,self.CLSidx,:].unsqueeze(2), k.transpose(-2, -1))
+        dk = torch.tensor(k.size(-1), dtype=torch.float32)
+        scaled_CLS_logits = matmul_CLS_k / torch.sqrt(dk)
+
+        # if mask is not None:
+        #     scaled_attention_logits += (mask * -1e9)
+
+        # attention_weights = F.softmax(scaled_attention_logits, dim=-1)
+
+        attention_weight = masked_softmax(scaled_CLS_logits, mask,dim=-1)
+        attention_weight = self.dropout(attention_weight)
+        output = torch.matmul(attention_weight, v)
+
+        return output, attention_weight
+
+class ResNet(torch.nn.Module):
+  def __init__(self, 
+        num_layers: int,
+        input_size: int,
+        hidden_layers: list,
+        activation: str,
+        norm_layer: str = None,
+        dropout=0.0):
+    super().__init__()
+
+    layers = []
+
+    self.num_layers = num_layers
+
+    self.activation = getattr(torch.nn, activation)()
+
+    for i in range(self.num_layers):
+      layers.append( Dense(input_size= input_size, output_size= input_size, hidden_layers= hidden_layers, activation= activation, norm_layer=norm_layer, dropout=dropout))
+
+      # build the net
+    self.net = torch.nn.Sequential(*layers)
+
+  def forward(self, x):
+
+    for i in range(self.num_layers):
+      x = self.activation(x + self.net(x))
+
+    return x
 
 class PlayerEncoder(torch.nn.Module):
   def __init__(self, input_size, hidden_size, num_heads: int = 8):
     super().__init__()
     #self.entity_dim = 31
     self.entity_dim = 32 # 31 entity dims + 1 tick dim
-    # self.player_offset = torch.tensor([i * 256 for i in range(self.entity_dim)])
-    # self.embedding = torch.nn.Embedding(self.entity_dim * 256, 32)
 
     self.agent_fc = torch.nn.Linear(self.entity_dim * 4, hidden_size)
     self.my_agent_fc = torch.nn.Linear(self.entity_dim * 4, input_size)
@@ -312,6 +390,8 @@ class PlayerEncoder(torch.nn.Module):
     self.dense = Dense(self.entity_dim, self.entity_dim*4, hidden_layers=[self.entity_dim*2], activation="SiLU", norm_layer="LayerNorm")
     self.num_heads = num_heads
     self.transformer = TransformerEncoder(self.entity_dim*4, num_layers=6, num_heads= self.num_heads, dense_config={"hidden_layers":[256], "activation": "SiLU", "norm_layer": "LayerNorm"})
+
+    self.final_norm = torch.nn.LayerNorm(input_size)
 
   def forward(self, agents, my_id):
     # Pull out rows corresponding to the agent
@@ -322,14 +402,6 @@ class PlayerEncoder(torch.nn.Module):
     row_indices = torch.where(
         mask.any(dim=1), mask.argmax(dim=1), torch.zeros_like(mask.sum(dim=1))
     )
-
-    # agent_embeddings = self.embedding(
-    #     agents.long().clip(0, 255) + self.player_offset.to(agents.device)
-    # )
-    # batch, agent, attrs, embed = agent_embeddings.shape
-
-    # # Embed each feature separately
-    # agent_embeddings = agent_embeddings.view(batch, agent, attrs * embed)
 
     agent_embeddings = self.dense(agents)
 
@@ -344,36 +416,13 @@ class PlayerEncoder(torch.nn.Module):
     my_agent_embeddings = self.my_agent_fc(my_agent_embeddings)
     my_agent_embeddings = F.relu(my_agent_embeddings)
 
-    return agent_embeddings, my_agent_embeddings
+    return self.final_norm(agent_embeddings), self.final_norm(my_agent_embeddings)
 
 
 class ItemEncoder(torch.nn.Module):
   def __init__(self, input_size, hidden_size, num_heads: int = 8):
     super().__init__()
-    # self.item_offset = torch.tensor([i * 256 for i in range(16)])
-    # self.embedding = torch.nn.Embedding(256, 32)
 
-    # self.fc = torch.nn.Linear(2 * 32 + 12, hidden_size)
-
-    # self.discrete_idxs = [1, 14]
-    # self.discrete_offset = torch.Tensor([2, 0])
-    # self.continuous_idxs = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15]
-    # self.continuous_scale = torch.Tensor(
-    #     [
-    #         1 / 10,
-    #         1 / 10,
-    #         1 / 10,
-    #         1 / 100,
-    #         1 / 100,
-    #         1 / 100,
-    #         1 / 40,
-    #         1 / 40,
-    #         1 / 40,
-    #         1 / 100,
-    #         1 / 100,
-    #         1 / 100,
-    #     ]
-    # )
 
     item_embed_dim=16
     hidden_embed_dim1=32
@@ -382,35 +431,13 @@ class ItemEncoder(torch.nn.Module):
     self.dense1 = Dense(item_embed_dim, hidden_embed_dim2, hidden_layers=[hidden_embed_dim1], activation="SiLU", norm_layer="LayerNorm")
     self.dense2 = Dense(hidden_embed_dim2, hidden_size, hidden_layers=[hidden_embed_dim3], activation="SiLU", norm_layer="LayerNorm")
     self.final_norm = torch.nn.LayerNorm(hidden_size)
-    #self.num_heads = num_heads
-    #self.transformer = TransformerEncoder(hidden_embed_dim, num_layers=6, num_heads= self.num_heads, dense_config={"hidden_layers":[128], "activation": "SiLU", "norm_layer": "LayerNorm"})
-    #self.fc = torch.nn.Linear(hidden_embed_dim, input_size)
+    self.resnet = ResNet(num_layers=4, input_size=hidden_size, hidden_layers=[hidden_embed_dim3], activation="SiLU", norm_layer='LayerNorm',dropout=0.1)
 
   def forward(self, items):
-    # if self.discrete_offset.device != items.device:
-    #   self.discrete_offset = self.discrete_offset.to(items.device)
-    #   self.continuous_scale = self.continuous_scale.to(items.device)
 
-    # # Embed each feature separately
-    # discrete = items[:, :, self.discrete_idxs] + self.discrete_offset
-    # discrete = self.embedding(discrete.long().clip(0, 255))
-    # batch, item, attrs, embed = discrete.shape
-    # discrete = discrete.view(batch, item, attrs * embed)
-
-    # continuous = items[:, :, self.continuous_idxs] / self.continuous_scale
-
-    # item_embeddings = torch.cat([discrete, continuous], dim=-1)
-
-    # item_ids = items[:, :, EntityId]
-    # valid_mask = item_ids==0
-    # print(valid_mask.sum())
-
-    # item_embeddings = self.dense(items)
-    # item_embeddings = self.transformer(item_embeddings,mask=valid_mask)
-
-    # item_embeddings = self.fc(item_embeddings)
     item_embeddings = self.dense1(items)
     item_embeddings = self.dense2(item_embeddings)
+    item_embeddings = self.resnet(item_embeddings)
     item_embeddings = self.final_norm(item_embeddings)
     return item_embeddings
 
@@ -418,78 +445,76 @@ class ItemEncoder(torch.nn.Module):
 class InventoryEncoder(torch.nn.Module):
   def __init__(self, input_size, hidden_size):
     super().__init__()
-    # self.fc = torch.nn.Linear(12 * hidden_size, input_size)
 
-    self.pooling = GlobalAttentionPooling(input_size=input_size)
+    self.pooling = CLSPooling(embed_dim= input_size, CLSidx=0, num_heads= 8, dropout= 0.0)
+    self.cls_token = torch.nn.Parameter(torch.randn(1,1,input_size))
+    self.dense = Dense(input_size=input_size,output_size=input_size,hidden_layers=[128],activation='SiLU',norm_layer='LayerNorm')
+    self.final_norm = torch.nn.LayerNorm(input_size)
 
-  def forward(self, inventory):
-    # agents, items, hidden = inventory.shape
-    # inventory = inventory.view(agents, items * hidden)
+  def forward(self, inventory, items_unembedded):
 
-    inventory_ids = inventory[:, :, EntityId]
+    batch, items, embed_dim = inventory.shape
+
+    batch2, items2, embed_dim2 = items_unembedded.shape
+
+    cls_item = torch.ones(batch2, 1, embed_dim2,device=inventory.device)
+    cls_item = cls_item.int()
+
+    items_unembedded = torch.cat([cls_item,items_unembedded],dim=1)
+
+    inventory_ids = items_unembedded[:, :, EntityId]
     valid_mask = inventory_ids==0
 
-    return self.pooling(inventory, mask=valid_mask) 
+    cls_repeat = torch.repeat_interleave(self.cls_token, batch, dim=0)
+    inventory_cls = torch.cat([cls_repeat,inventory],dim=1)
+
+    CLS_token = self.pooling(inventory_cls,inventory_cls,inventory_cls,valid_mask)
+
+    return self.final_norm(self.dense(CLS_token.squeeze(1)) )
 
 
 class MarketEncoder(torch.nn.Module):
   def __init__(self, input_size, hidden_size):
     super().__init__()
-    # self.fc = torch.nn.Linear(hidden_size, input_size)
 
-    self.pooling = GlobalAttentionPooling(input_size=input_size)
+    #self.pooling = GlobalAttentionPooling(input_size=input_size)
+    self.pooling = CLSPooling(embed_dim= input_size, CLSidx=0, num_heads= 8, dropout= 0.0)
+    self.cls_token = torch.nn.Parameter(torch.randn(1,1,input_size))
+    self.dense = Dense(input_size=input_size,output_size=input_size,hidden_layers=[128],activation='SiLU',norm_layer='LayerNorm')
+    self.final_norm = torch.nn.LayerNorm(input_size)
 
-  def forward(self, market):
+  def forward(self, market, items_unembedded):
 
-    market_ids = market[:, :, EntityId]
+    batch, items, embed_dim = market.shape
+
+    batch2, items2, embed_dim2 = items_unembedded.shape
+
+    cls_item = torch.ones(batch2, 1, embed_dim2,device=market.device)
+    cls_item = cls_item.int()
+
+    items_unembedded = torch.cat([cls_item,items_unembedded],dim=1)
+
+    market_ids = items_unembedded[:, :, EntityId]
     valid_mask = market_ids==0
 
-    return self.pooling(market, mask=valid_mask) 
+    cls_repeat = torch.repeat_interleave(self.cls_token, batch, dim=0)
+    market_cls = torch.cat([cls_repeat,market],dim=1)
 
-    #return self.fc(market).mean(-2)
+    CLS_token = self.pooling(market_cls,market_cls,market_cls,valid_mask)
 
-
-
-class ResNet(torch.nn.Module):
-  def __init__(self, 
-        num_layers: int,
-        input_size: int,
-        output_size: int,
-        hidden_layers: list,
-        activation: str,
-        norm_layer: str = None,
-        dropout=0.0):
-    super().__init__()
-
-    layers = []
-
-    self.num_layers = num_layers
-
-    self.activation = getattr(torch.nn, activation)()
-
-    for i in range(self.num_layers):
-      layers.append( Dense(input_size= input_size, output_size= output_size, hidden_layers= hidden_layers, activation= activation, norm_layer=norm_layer, dropout=dropout))
-
-      # build the net
-    self.net = torch.nn.Sequential(*layers)
-
-  def forward(self, x):
-
-    for i in range(self.num_layers):
-      x = self.activation(x + self.net(x))
-
-    return x
+    return self.final_norm(self.dense(CLS_token.squeeze(1)) )
 
 
 class TaskEncoder(torch.nn.Module):
   def __init__(self, input_size, hidden_size, task_size):
     super().__init__()
 
-    self.resnet = ResNet(num_layers=16, input_size=task_size, output_size=task_size, hidden_layers=[1024], activation="SiLU", norm_layer='LayerNorm',dropout=0.1)
+    self.resnet = ResNet(num_layers=16, input_size=task_size, hidden_layers=[1024], activation="SiLU", norm_layer='LayerNorm',dropout=0.1)
     self.fc = torch.nn.Linear(task_size, input_size)
+    self.final_norm = torch.nn.LayerNorm(input_size)
 
   def forward(self, task):
-    return self.fc(self.resnet(task.clone()))
+    return self.final_norm(self.fc(self.resnet(task.clone())))
 
 
 class ActionDecoder(torch.nn.Module):
@@ -498,24 +523,27 @@ class ActionDecoder(torch.nn.Module):
     self.layers = torch.nn.ModuleDict(
         {
             "attack_style": torch.nn.Linear(hidden_size, 3),
-            "attack_target": torch.nn.Linear(hidden_size, hidden_size),
-            "market_buy": torch.nn.Linear(hidden_size, hidden_size),
-            "inventory_destroy": torch.nn.Linear(hidden_size, hidden_size),
-            "inventory_give_item": torch.nn.Linear(hidden_size, hidden_size),
-            "inventory_give_player": torch.nn.Linear(hidden_size, hidden_size),
+            "attack_target": torch.nn.Linear(hidden_size*2, 1),
+            "market_buy": torch.nn.Linear(hidden_size*2, 1),
+            "inventory_destroy": torch.nn.Linear(hidden_size*2, 1),
+            "inventory_give_item": torch.nn.Linear(hidden_size*2, 1),
+            "inventory_give_player": torch.nn.Linear(hidden_size*2, 1),
             "gold_quantity": torch.nn.Linear(hidden_size, 99),
-            "gold_target": torch.nn.Linear(hidden_size, hidden_size),
+            "gold_target": torch.nn.Linear(hidden_size*2, 1),
             "move": torch.nn.Linear(hidden_size, 5),
-            "inventory_sell": torch.nn.Linear(hidden_size, hidden_size),
+            "inventory_sell": torch.nn.Linear(hidden_size*2, 1),
             "inventory_price": torch.nn.Linear(hidden_size, 99),
-            "inventory_use": torch.nn.Linear(hidden_size, hidden_size),
+            "inventory_use": torch.nn.Linear(hidden_size*2, 1),
         }
     )
 
   def apply_layer(self, layer, embeddings, mask, hidden):
-    hidden = layer(hidden)
+
     if hidden.dim() == 2 and embeddings is not None:
-      hidden = torch.matmul(embeddings, hidden.unsqueeze(-1)).squeeze(-1)
+      hidden = layer(embeddings)
+      hidden = hidden.squeeze(-1)
+    else:
+      hidden = layer(hidden)
 
     if mask is not None:
       hidden = hidden.masked_fill(mask == 0, -1e9)
@@ -531,14 +559,14 @@ class ActionDecoder(torch.nn.Module):
     ) = lookup
 
     embeddings = {
-        "attack_target": player_embeddings,
-        "market_buy": market_embeddings,
-        "inventory_destroy": inventory_embeddings,
-        "inventory_give_item": inventory_embeddings,
-        "inventory_give_player": player_embeddings,
-        "gold_target": player_embeddings,
-        "inventory_sell": inventory_embeddings,
-        "inventory_use": inventory_embeddings,
+        "attack_target": torch.cat([player_embeddings,torch.repeat_interleave(hidden.unsqueeze(1), player_embeddings.shape[1], dim=1)],dim=-1),
+        "market_buy": torch.cat([market_embeddings,torch.repeat_interleave(hidden.unsqueeze(1), market_embeddings.shape[1], dim=1)],dim=-1),
+        "inventory_destroy": torch.cat([inventory_embeddings,torch.repeat_interleave(hidden.unsqueeze(1), inventory_embeddings.shape[1], dim=1)],dim=-1),
+        "inventory_give_item": torch.cat([inventory_embeddings,torch.repeat_interleave(hidden.unsqueeze(1), inventory_embeddings.shape[1], dim=1)],dim=-1),
+        "inventory_give_player": torch.cat([player_embeddings,torch.repeat_interleave(hidden.unsqueeze(1), player_embeddings.shape[1], dim=1)],dim=-1),
+        "gold_target": torch.cat([player_embeddings,torch.repeat_interleave(hidden.unsqueeze(1), player_embeddings.shape[1], dim=1)],dim=-1),
+        "inventory_sell": torch.cat([inventory_embeddings,torch.repeat_interleave(hidden.unsqueeze(1), inventory_embeddings.shape[1], dim=1)],dim=-1),
+        "inventory_use": torch.cat([inventory_embeddings,torch.repeat_interleave(hidden.unsqueeze(1), inventory_embeddings.shape[1], dim=1)],dim=-1),
     }
 
     action_targets = {
