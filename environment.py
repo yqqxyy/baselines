@@ -2,6 +2,8 @@ from argparse import Namespace
 import math
 
 import nmmo
+from nmmo.core.config import Default
+from collections import defaultdict
 import pufferlib
 import pufferlib.emulation
 
@@ -110,11 +112,57 @@ class Postprocessor(StatPostprocessor):
         return reward, done, info
 
 
+class cumstomed_nmmo_Env(nmmo.Env):
+  # Environment wrapper for Neural MMO using the Parallel PettingZoo API
+
+  #pylint: disable=no-value-for-parameter
+  def __init__(self,
+               config: Default = nmmo.config.Default(),
+               seed = None):
+    super().__init__(config, seed)
+
+  def _compute_rewards(self):
+    # Initialization
+    agents = set(self.agents)
+    infos = {agent_id: {'task': {}} for agent_id in agents}
+    rewards = defaultdict(int)
+
+    # Clean up unnecessary game state, which cause memory leaks
+    if self.game_state is not None:
+      self.game_state.clear_cache()
+      self.game_state = None
+
+    # Compute Rewards and infos
+    self.game_state = self._gamestate_generator.generate(self.realm, self.obs)
+    for task in self.tasks:
+      if agents.intersection(task.assignee): # evaluate only if the agents are current
+        task_rewards, task_infos = task.compute_rewards(self.game_state)
+        #print('task_rewards :',task_rewards,' task_infos: ',task_infos,' task name: ',task.name)
+        for agent_id, reward in task_rewards.items():
+          if agent_id in agents:
+            if 'FOOD' in task_infos[agent_id]['task_spec'] or 'WATER' in task_infos[agent_id]['task_spec']:
+               reward = 1.5*reward
+            if 'Gold' in task_infos[agent_id]['task_spec']:
+               reward = 1.2*reward
+            rewards[agent_id] = rewards.get(agent_id,0) + reward
+            infos[agent_id]['task'][task.name] = task_infos[agent_id] # include progress, etc.
+      else:
+        task.close()  # To prevent memory leak
+
+    # Make sure the dead agents return the rewards of -1
+    for agent_id in self._dead_this_tick:
+      rewards[agent_id] = -1
+
+    return rewards, infos
+
+
+
+
 def make_env_creator(args: Namespace):
     # TODO: Max episode length
     def env_creator():
         """Create an environment."""
-        env = nmmo.Env(Config(args))
+        env = cumstomed_nmmo_Env(Config(args))
         env = pufferlib.emulation.PettingZooPufferEnv(env,
             postprocessor_cls=Postprocessor,
             postprocessor_kwargs={

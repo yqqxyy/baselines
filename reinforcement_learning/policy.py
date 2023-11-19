@@ -431,13 +431,13 @@ class ItemEncoder(torch.nn.Module):
     self.dense1 = Dense(item_embed_dim, hidden_embed_dim2, hidden_layers=[hidden_embed_dim1], activation="SiLU", norm_layer="LayerNorm")
     self.dense2 = Dense(hidden_embed_dim2, hidden_size, hidden_layers=[hidden_embed_dim3], activation="SiLU", norm_layer="LayerNorm")
     self.final_norm = torch.nn.LayerNorm(hidden_size)
-    self.resnet = ResNet(num_layers=4, input_size=hidden_size, hidden_layers=[hidden_embed_dim3], activation="SiLU", norm_layer='LayerNorm',dropout=0.1)
+    #self.resnet = ResNet(num_layers=4, input_size=hidden_size, hidden_layers=[hidden_embed_dim3], activation="SiLU", norm_layer='LayerNorm',dropout=0.1)
 
   def forward(self, items):
 
     item_embeddings = self.dense1(items)
     item_embeddings = self.dense2(item_embeddings)
-    item_embeddings = self.resnet(item_embeddings)
+    #item_embeddings = self.resnet(item_embeddings)
     item_embeddings = self.final_norm(item_embeddings)
     return item_embeddings
 

@@ -293,6 +293,7 @@ class CleanPuffeRL:
             env_step_time += time.time() - start
 
             i = self.policy_pool.update_scores(i, "return")
+            #print('i: ',i)
 
             '''
             for profile in self.buffers[buf].profile():
@@ -389,6 +390,7 @@ class CleanPuffeRL:
                             stats[policy_name][name].append(stat)
                         except:
                             continue
+            #print('stats: ',stats)
 
         if self.policy_pool.scores and self.policy_ranker is not None:
           self.policy_ranker.update_ranks(
