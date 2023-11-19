@@ -389,7 +389,7 @@ class PlayerEncoder(torch.nn.Module):
 
     self.dense = Dense(self.entity_dim, self.entity_dim*4, hidden_layers=[self.entity_dim*2], activation="SiLU", norm_layer="LayerNorm")
     self.num_heads = num_heads
-    self.transformer = TransformerEncoder(self.entity_dim*4, num_layers=6, num_heads= self.num_heads, dense_config={"hidden_layers":[256], "activation": "SiLU", "norm_layer": "LayerNorm"})
+    self.transformer = TransformerEncoder(self.entity_dim*4, num_layers=4, num_heads= self.num_heads, dense_config={"hidden_layers":[256], "activation": "SiLU", "norm_layer": "LayerNorm"})
 
     self.final_norm = torch.nn.LayerNorm(input_size)
 
@@ -509,7 +509,7 @@ class TaskEncoder(torch.nn.Module):
   def __init__(self, input_size, hidden_size, task_size):
     super().__init__()
 
-    self.resnet = ResNet(num_layers=16, input_size=task_size, hidden_layers=[1024], activation="SiLU", norm_layer='LayerNorm',dropout=0.1)
+    self.resnet = ResNet(num_layers=12, input_size=task_size, hidden_layers=[1024], activation="SiLU", norm_layer='LayerNorm',dropout=0.1)
     self.fc = torch.nn.Linear(task_size, input_size)
     self.final_norm = torch.nn.LayerNorm(input_size)
 
