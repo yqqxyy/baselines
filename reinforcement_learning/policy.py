@@ -86,29 +86,75 @@ class Baseline(pufferlib.models.Policy):
     return actions, value
 
 
+
+class ResNetBlock2D(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.conv1 = torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = torch.nn.BatchNorm2d(out_channels)
+        self.relu = torch.nn.ReLU()
+        self.conv2 = torch.nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = torch.nn.BatchNorm2d(out_channels)
+
+        # If the input and output channels are not the same, we need to downsample the input
+        if stride != 1 or in_channels != out_channels:
+            self.downsample = torch.nn.Sequential(
+                torch.nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                torch.nn.BatchNorm2d(out_channels)
+            )
+        else:
+            self.downsample = None
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+
 class TileEncoder(torch.nn.Module):
   def __init__(self, input_size):
     super().__init__()
-    self.tile_offset = torch.tensor([i * 256 for i in range(3)])
-    self.embedding = torch.nn.Embedding(3 * 256, 32)
 
-    self.tile_conv_1 = torch.nn.Conv2d(96, 32, 3)
-    self.tile_conv_2 = torch.nn.Conv2d(32, 8, 3)
+    self.embedding = torch.nn.Embedding(256, 32)
+
+    self.resnet_block_1 = ResNetBlock2D(34,34)
+    self.resnet_block_2 = ResNetBlock2D(34,34)
+    self.resnet_block_3 = ResNetBlock2D(34,34)
+    self.resnet_block_4 = ResNetBlock2D(34,34)
+    self.resnet_block_5 = ResNetBlock2D(34,34)
+    self.resnet_block_6 = ResNetBlock2D(34,34)
+
+    self.tile_conv_1 = torch.nn.Conv2d(34, 16, 3)
+    self.tile_conv_2 = torch.nn.Conv2d(16, 8, 3)
     self.tile_fc = torch.nn.Linear(8 * 11 * 11, input_size)
 
   def forward(self, tile):
-    tile[:, :, :2] -= tile[:, 112:113, :2].clone()
-    tile[:, :, :2] += 7
-    tile = self.embedding(
-        tile.long().clip(0, 255) + self.tile_offset.to(tile.device)
-    )
 
-    agents, tiles, features, embed = tile.shape
-    tile = (
-        tile.view(agents, tiles, features * embed)
-        .transpose(1, 2)
-        .view(agents, features * embed, 15, 15)
-    )
+    material_id = tile[:,:,2]
+    material_id_embed = self.embedding(material_id.long().clip(0,255))
+    tile = torch.cat([tile[:,:,:2],material_id_embed],dim=-1)
+    agents, tiles, features = tile.shape
+    tile = tile.transpose(1,2).view(agents,features,15,15)
+
+    tile = self.resnet_block_1(tile)
+    tile = self.resnet_block_2(tile)
+    tile = self.resnet_block_3(tile)
+    tile = self.resnet_block_4(tile)
+    tile = self.resnet_block_5(tile)
+    tile = self.resnet_block_6(tile)
 
     tile = F.relu(self.tile_conv_1(tile))
     tile = F.relu(self.tile_conv_2(tile))
@@ -423,17 +469,24 @@ class ItemEncoder(torch.nn.Module):
   def __init__(self, input_size, hidden_size, num_heads: int = 8):
     super().__init__()
 
+    self.embedding = torch.nn.Embedding(17, 32)
 
     item_embed_dim=16
     hidden_embed_dim1=32
     hidden_embed_dim2=64
     hidden_embed_dim3=128
-    self.dense1 = Dense(item_embed_dim, hidden_embed_dim2, hidden_layers=[hidden_embed_dim1], activation="SiLU", norm_layer="LayerNorm")
+    self.dense1 = Dense(item_embed_dim-1+32, hidden_embed_dim2, hidden_layers=[hidden_embed_dim1], activation="SiLU", norm_layer="LayerNorm")
     self.dense2 = Dense(hidden_embed_dim2, hidden_size, hidden_layers=[hidden_embed_dim3], activation="SiLU", norm_layer="LayerNorm")
     self.final_norm = torch.nn.LayerNorm(hidden_size)
     #self.resnet = ResNet(num_layers=4, input_size=hidden_size, hidden_layers=[hidden_embed_dim3], activation="SiLU", norm_layer='LayerNorm',dropout=0.1)
 
   def forward(self, items):
+
+    items_id = items[:,:,0:1]
+    items_type_id = items[:,:,1]
+    items_type_id_embed = self.embedding(items_type_id.long().clip(0,16))
+
+    items = torch.cat([items_id,items_type_id_embed,items[:,:,2:]],dim=-1)
 
     item_embeddings = self.dense1(items)
     item_embeddings = self.dense2(item_embeddings)
@@ -509,12 +562,12 @@ class TaskEncoder(torch.nn.Module):
   def __init__(self, input_size, hidden_size, task_size):
     super().__init__()
 
-    self.resnet = ResNet(num_layers=12, input_size=task_size, hidden_layers=[1024], activation="SiLU", norm_layer='LayerNorm',dropout=0.1)
+    #self.resnet = ResNet(num_layers=12, input_size=task_size, hidden_layers=[1024], activation="SiLU", norm_layer='LayerNorm',dropout=0.1)
     self.fc = torch.nn.Linear(task_size, input_size)
     self.final_norm = torch.nn.LayerNorm(input_size)
 
   def forward(self, task):
-    return self.final_norm(self.fc(self.resnet(task.clone())))
+    return self.final_norm(self.fc(task.clone()))
 
 
 class ActionDecoder(torch.nn.Module):

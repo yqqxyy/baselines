@@ -8,7 +8,7 @@ class Config:
     local_mode = False  # Run in local mode
     # Track to run - options: reinforcement_learning, curriculum_generation
     track = "rl"
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    device = "cuda:2" if torch.cuda.is_available() else "cpu"
     #record_loss = False  # log all minibatch loss and actions, for debugging
 
     # Trainer Args
@@ -21,7 +21,7 @@ class Config:
     train_num_steps = 10_000_000  # Number of steps to train
     eval_num_steps = 1_000_000  # Number of steps to evaluate
     checkpoint_interval = 10  # Interval to save models
-    run_name = f"nmmoLSTMv4.2_{time.strftime('%Y%m%d_%H%M%S')}"  # Run name
+    run_name = f"nmmo_v4.4_{time.strftime('%Y%m%d_%H%M%S')}"  # Run name
     runs_dir = "/tmp/runs"  # Directory for runs
     policy_store_dir = None # Policy store directory
     use_serial_vecenv = False  # Use serial vecenv implementation
@@ -29,7 +29,7 @@ class Config:
     max_opponent_policies = 0  # Maximum number of opponent policies to train against
     eval_num_policies = 2 # Number of policies to use for evaluation
     eval_num_rounds = 1 # Number of rounds to use for evaluation
-    wandb_project = "nmmo2023_LSTMv4.2"  # WandB project name
+    wandb_project = "nmmo2023_v4.4"  # WandB project name
     wandb_entity = "yqqxyy"  # WandB entity name
 
     # PPO Args

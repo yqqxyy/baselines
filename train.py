@@ -36,7 +36,7 @@ def setup_env(args):
             hidden_size=args.hidden_size,
             task_size=args.task_size
         )
-        return cleanrl.RecurrentPolicy(pufferlib.models.RecurrentWrapper(envs.driver_env,learner_policy,input_size = args.input_size,hidden_size = args.hidden_size))
+        return cleanrl.Policy(learner_policy)#cleanrl.RecurrentPolicy(pufferlib.models.RecurrentWrapper(envs.driver_env,learner_policy,input_size = args.input_size,hidden_size = args.hidden_size))
 
     trainer = clean_pufferl.CleanPuffeRL(
         device=torch.device(args.device),
