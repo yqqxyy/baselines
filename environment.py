@@ -140,10 +140,10 @@ class cumstomed_nmmo_Env(nmmo.Env):
         #print('task_rewards :',task_rewards,' task_infos: ',task_infos,' task name: ',task.name)
         for agent_id, reward in task_rewards.items():
           if agent_id in agents:
-            if 'FOOD' in task_infos[agent_id]['task_spec'] or 'WATER' in task_infos[agent_id]['task_spec']:
-               reward = 1.5*reward
-            if 'Gold' in task_infos[agent_id]['task_spec']:
-               reward = 1.2*reward
+            # if 'FOOD' in task_infos[agent_id]['task_spec'] or 'WATER' in task_infos[agent_id]['task_spec']:
+            #    reward = 1.5*reward
+            # if 'Gold' in task_infos[agent_id]['task_spec']:
+            #    reward = 1.2*reward
             rewards[agent_id] = rewards.get(agent_id,0) + reward
             infos[agent_id]['task'][task.name] = task_infos[agent_id] # include progress, etc.
       else:
