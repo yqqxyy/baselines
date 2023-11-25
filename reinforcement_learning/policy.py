@@ -57,7 +57,7 @@ class Baseline(pufferlib.models.Policy):
     tile = self.tile_encoder(env_outputs["Tile"])
 
     ticks_repeat = torch.repeat_interleave(env_outputs['CurrentTick'][:, None, :], env_outputs["Entity"].shape[-2], dim=1)
-    Entity_with_tick = torch.cat([ticks_repeat, env_outputs["Entity"]], dim=2)
+    Entity_with_tick = torch.cat([env_outputs["Entity"],ticks_repeat], dim=2)
     player_embeddings, my_agent = self.player_encoder(
         Entity_with_tick, env_outputs["AgentId"][:, 0]
     )
